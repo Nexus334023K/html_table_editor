@@ -723,6 +723,24 @@
             display: block;
         }
 
+        /* Cell inline editor */
+        .cell-input {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: 2px solid var(--primary);
+            outline: none;
+            font-family: var(--font-main);
+            font-size: 12px;
+            z-index: 50;
+            box-sizing: border-box;
+            background: var(--bg-sidebar);
+            color: var(--text-color);
+            padding: 0 6px;
+        }
+
         /* ===== BOTTOM TABS & STATS BAR ===== */
         .sheet-bar {
             display: flex;
@@ -1407,6 +1425,12 @@
                     <button class="ribbon-btn" onclick="toggleFindReplaceDrawer()">🔍 Find & Replace</button>
                 </div>
                 <div class="ribbon-group-label">Search & Sort</div>
+            </div>
+            <div class="ribbon-group">
+                <div class="ribbon-group-row">
+                    <button class="ribbon-btn primary-action" id="btnMagicFill" data-testid="magic-fill-button" onclick="magicFill()" title="Magic Fill (Ctrl+E)">✨ Magic Fill</button>
+                </div>
+                <div class="ribbon-group-label">Autofill</div>
             </div>
         </div>
 
@@ -2582,9 +2606,9 @@
 
                         html += `
                             <div class="${classes}${stickyColClass}" 
-                                 data-row="${r}" data-col="${c}" 
+                                 data-row="${r}" data-col="${c}" data-testid="cell-${r}-${c}"
                                  style="${rowSpan}${colSpan}${styleStr}${stickyColStyle}">
-                                 <span style="flex:1; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(displayVal)}</span>
+                                 <span class="cell-content" style="flex:1; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(displayVal)}</span>
                                  ${valArrow}
                             </div>
                         `;
@@ -2827,13 +2851,7 @@
                 const cell = getCell(r, c);
                 
                 const input = document.createElement('input');
-                input.className = 'formula-input';
-                input.style.position = 'absolute';
-                input.style.top = '0';
-                input.style.left = '0';
-                input.style.width = '100%';
-                input.style.height = '100%';
-                input.style.zIndex = '50';
+                input.className = 'cell-input';
                 input.value = cell.raw !== undefined ? cell.raw : '';
                 
                 element.appendChild(input);
@@ -3023,7 +3041,7 @@
                     } else { // Fill left
                         for (let c = end.startCol; c < s.sC; c++) {
                             const offset = s.sC - c;
-                            const srcCol = eC - ((offset - 1) % srcWidth);
+                            const srcCol = s.eC - ((offset - 1) % srcWidth);
                             for (let r = s.sR; r <= s.eR; r++) {
                                 autofillProjectCell(r, srcCol, r, c, -Math.floor((offset - 1) / srcWidth) - 1);
                             }
@@ -3101,19 +3119,72 @@
                 }
             }
 
-            function shiftFormula(formula, rowOffset, colOffset) {
-                if (typeof formula !== 'string' || !formula.startsWith('=')) return formula;
-                const regex = /(\$)?([A-Z]+)(\$)?([0-9]+)/ig;
-                return formula.replace(regex, (match, colAbs, colLetter, rowAbs, rowNumStr) => {
-                    let col = letterToCol(colLetter);
-                    let row = parseInt(rowNumStr, 10) - 1;
-                    if (!colAbs) col += colOffset;
-                    if (!rowAbs) row += rowOffset;
-                    const newColLetter = colToLetter(Math.max(0, Math.min(col, COLS - 1)));
-                    const newRowNum = Math.max(0, Math.min(row, ROWS - 1)) + 1;
-                    return (colAbs || '') + newColLetter + (rowAbs || '') + newRowNum;
-                });
-            }
+            // -------- MAGIC FILL (PATTERN DETECTOR) --------
+            window.magicFill = function() {
+                const sel = state.selection;
+                if (sel.type !== 'range' && sel.type !== 'cell') {
+                    setStatus('Select a range of numbers first to auto-fill the pattern!');
+                    return;
+                }
+                const startRow = Math.min(sel.startRow, sel.endRow);
+                const endRow = Math.max(sel.startRow, sel.endRow);
+                const col = sel.startCol;
+
+                const values = [];
+                for (let r = startRow; r <= endRow; r++) {
+                    const cell = getCell(r, col);
+                    if (cell) values.push(cell.value);
+                }
+
+                if (values.length < 2) {
+                    setStatus('Need at least 2 cells with numbers to detect a pattern');
+                    return;
+                }
+
+                const numericSeeds = values
+                    .map((v, index) => ({ value: parseFloat(v), row: startRow + index }))
+                    .filter(seed => !isNaN(seed.value));
+                
+                if (numericSeeds.length >= 2) {
+                    const rowGap = numericSeeds[1].row - numericSeeds[0].row;
+                    const diff = rowGap === 0 ? NaN : (numericSeeds[1].value - numericSeeds[0].value) / rowGap;
+                    if (diff !== 0 && !isNaN(diff)) {
+                        pushUndo();
+                        
+                        // Fill the selected column from the first two numeric seeds, including blank cells.
+                        for (let r = startRow; r <= endRow; r++) {
+                            const cell = getCell(r, col);
+                            if (cell) {
+                                const newVal = numericSeeds[0].value + diff * (r - numericSeeds[0].row);
+                                cell.value = newVal;
+                                cell.raw = String(newVal);
+                            }
+                        }
+                        render();
+                        updateSmartView();
+                        checkMissionProgress();
+                        setStatus('Magic Fill complete! Detected number series.');
+                        return;
+                    }
+                }
+                
+                // If not numeric pattern, do simple repetition copy inside selection
+                pushUndo();
+                for (let r = startRow + 1; r <= endRow; r++) {
+                    const cell = getCell(r, col);
+                    if (cell) {
+                        const src = getCell(startRow + ((r - startRow) % (endRow - startRow + 1)), col);
+                        if (src) {
+                            cell.value = src.value;
+                            cell.raw = src.raw;
+                        }
+                    }
+                }
+                render();
+                updateSmartView();
+                checkMissionProgress();
+                setStatus('Magic Fill complete! Copied repeated elements.');
+            };
 
             // -------- TOPOLOGICAL EVALUATION FOR FORMULAS DEPENDENTS --------
             function propagateCalculations() {
@@ -3145,6 +3216,10 @@
                     e.preventDefault();
                     const el = getCellElement(active.row, active.col);
                     if (el) startCellEditing(active.row, active.col, el);
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const el = getCellElement(active.row, active.col);
+                    if (el) startCellEditing(active.row, active.col, el);
                 } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
                     // Type directly
                     const el = getCellElement(active.row, active.col);
@@ -3159,6 +3234,7 @@
 
                 // Keyboard Ctrl hotkeys
                 if (e.ctrlKey || e.metaKey) {
+                    const ctrl = true;
                     if (e.key === 'z') { e.preventDefault(); undo(); }
                     else if (e.key === 'y') { e.preventDefault(); redo(); }
                     else if (e.key === 'c') { e.preventDefault(); copySelection(); }
@@ -3168,6 +3244,7 @@
                     else if (e.key === 'i') { e.preventDefault(); applyStyle({ italic: !getCurrentStyle('italic') }); }
                     else if (e.key === 'u') { e.preventDefault(); applyStyle({ underline: !getCurrentStyle('underline') }); }
                     else if (e.key === 'f') { e.preventDefault(); toggleFindReplaceDrawer(); }
+                    else if (e.key === 'e') { e.preventDefault(); magicFill(); }
                 }
             }
 
@@ -4428,9 +4505,12 @@
                 const titles = ['Cell Explorer', 'Style Designer', 'Formula Wizard', 'Data Detective', 'Spreadsheet Master'];
                 const titleText = titles[Math.min(currentLvl - 1, titles.length - 1)];
                 
-                document.getElementById('levelName').textContent = `Level ${currentLvl}: ${titleText}`;
-                document.getElementById('levelXP').textContent = `${progressXP} / 100 XP`;
-                document.getElementById('xpProgress').style.width = `${progressXP}%`;
+                const lvlName = document.getElementById('levelName');
+                const lvlXP = document.getElementById('levelXP');
+                const xpProg = document.getElementById('xpProgress');
+                if (lvlName) lvlName.textContent = `Level ${currentLvl}: ${titleText}`;
+                if (lvlXP) lvlXP.textContent = `${progressXP} / 100 XP`;
+                if (xpProg) xpProg.style.width = `${progressXP}%`;
             }
 
             function renderMissions() {
@@ -4645,23 +4725,29 @@
 
             // Avatar selectors
             let avatarIdx = 0;
-            document.getElementById('avatarSelector').addEventListener('click', () => {
-                avatarIdx = (avatarIdx + 1) % AVATARS.length;
-                const next = AVATARS[avatarIdx];
-                document.getElementById('currentAvatar').textContent = next.emoji;
-                document.getElementById('currentAvatarName').textContent = next.name;
-                setStatus(`Welcome, ${next.name}!`);
-                triggerConfettiCelebration();
-            });
+            const avatarSelector = document.getElementById('avatarSelector');
+            if (avatarSelector) {
+                avatarSelector.addEventListener('click', () => {
+                    avatarIdx = (avatarIdx + 1) % AVATARS.length;
+                    const next = AVATARS[avatarIdx];
+                    document.getElementById('currentAvatar').textContent = next.emoji;
+                    document.getElementById('currentAvatarName').textContent = next.name;
+                    setStatus(`Welcome, ${next.name}!`);
+                    triggerConfettiCelebration();
+                });
+            }
 
             // Toggle Academy Panel
-            document.getElementById('btnToggleAcademy').addEventListener('click', () => {
-                const panel = document.getElementById('academyPanel');
-                panel.classList.toggle('collapsed');
-                const isCollapsed = panel.classList.contains('collapsed');
-                document.getElementById('btnToggleAcademy').querySelector('span').textContent = isCollapsed ? 'Academy: Closed' : 'Academy: Open';
-                triggerGridResizeRedraw();
-            });
+            const toggleAcadBtn = document.getElementById('btnToggleAcademy');
+            if (toggleAcadBtn) {
+                toggleAcadBtn.addEventListener('click', () => {
+                    const panel = document.getElementById('academyPanel');
+                    panel.classList.toggle('collapsed');
+                    const isCollapsed = panel.classList.contains('collapsed');
+                    toggleAcadBtn.querySelector('span').textContent = isCollapsed ? 'Academy: Closed' : 'Academy: Open';
+                    triggerGridResizeRedraw();
+                });
+            }
 
             // General status indicators
             window.setStatus = function(msg) {
@@ -4677,7 +4763,7 @@
             };
 
             window.showShortcutHelp = function() {
-                alert("⌨️ Spreadsheet Shortcuts:\n\n• Ctrl + C : Copy Cells\n• Ctrl + X : Cut Cells\n• Ctrl + V : Paste Cells\n• Ctrl + Z : Undo Change\n• Ctrl + Y : Redo Change\n• Ctrl + B : Bold Toggle\n• Ctrl + I : Italic Toggle\n• Ctrl + U : Underline Toggle\n• Ctrl + F : Open Find & Replace\n• Delete : Clear selection contents\n• F2 : Edit Cell inline");
+                alert("⌨️ Spreadsheet Shortcuts:\n\n• Ctrl + C : Copy Cells\n• Ctrl + X : Cut Cells\n• Ctrl + V : Paste Cells\n• Ctrl + Z : Undo Change\n• Ctrl + Y : Redo Change\n• Ctrl + B : Bold Toggle\n• Ctrl + I : Italic Toggle\n• Ctrl + U : Underline Toggle\n• Ctrl + F : Open Find & Replace\n• Ctrl + E : Trigger Magic Fill\n• Delete : Clear selection contents\n• F2 : Edit Cell inline\n• Enter : Edit selected cell / Save edit");
             };
 
             window.showFormulaDoc = function() {
